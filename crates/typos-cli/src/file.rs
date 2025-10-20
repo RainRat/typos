@@ -227,6 +227,9 @@ impl FileChecker for InteractiveChecker {
                         Action::SkipFile => {
                             return Ok(());
                         }
+                        Action::Quit => {
+                            std::process::exit(0);
+                        }
                     }
                 }
 
@@ -292,6 +295,9 @@ impl FileChecker for InteractiveChecker {
                             }
                             break;
                         }
+                        Action::Quit => {
+                            std::process::exit(0);
+                        }
                     }
                 }
 
@@ -311,6 +317,7 @@ enum Action {
     Ignore,
     IgnoreAll,
     SkipFile,
+    Quit,
 }
 
 impl InteractiveChecker {
@@ -338,7 +345,11 @@ impl InteractiveChecker {
             // Print prompts to stderr so they appear even when stdout is redirected
             use std::io::Write as _;
             let mut err = std::io::stderr();
-            write!(err, "What to do? [i]gnore, ignore [a]ll, [s]kip file{}? ", options)?;
+            write!(
+                err,
+                "What to do? [i]gnore, ignore [a]ll, [s]kip file, [q]uit{}? ",
+                options
+            )?;
             err.flush()?;
 
             use std::io::BufRead;
@@ -367,6 +378,8 @@ impl InteractiveChecker {
                 return Ok(Action::IgnoreAll);
             } else if choice == "s" {
                 return Ok(Action::SkipFile);
+            } else if choice == "q" {
+                return Ok(Action::Quit);
             } else if let Ok(idx) = choice.parse::<usize>() {
                 if 1 <= idx && idx <= corrections.len() {
                     return Ok(Action::Fix(corrections[idx - 1].to_string()));
