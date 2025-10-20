@@ -154,6 +154,7 @@ pub struct InteractiveChecker {
     ignored_all: std::sync::Mutex<std::collections::HashSet<String>>,
     interactive: bool,
     tty: Option<std::sync::Mutex<std::io::BufReader<std::fs::File>>>,
+    pub dump_ignores: Option<std::path::PathBuf>,
 }
 
 fn open_tty() -> Option<std::sync::Mutex<std::io::BufReader<std::fs::File>>> {
@@ -170,6 +171,7 @@ impl Default for InteractiveChecker {
             ignored_all: Default::default(),
             interactive: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
             tty: open_tty(),
+            dump_ignores: None,
         }
     }
 }
@@ -230,6 +232,15 @@ impl FileChecker for InteractiveChecker {
                             return Ok(());
                         }
                         Action::Quit => {
+                            if let Some(output_path) = self.dump_ignores.as_ref() {
+                                let ignored = self.ignored_all();
+                                if !ignored.is_empty() {
+                                    let mut file = std::fs::File::create(output_path)?;
+                                    for typo in ignored {
+                                        writeln!(file, "{}", typo)?;
+                                    }
+                                }
+                            }
                             std::process::exit(0);
                         }
                     }
@@ -300,6 +311,15 @@ impl FileChecker for InteractiveChecker {
                             break;
                         }
                         Action::Quit => {
+                            if let Some(output_path) = self.dump_ignores.as_ref() {
+                                let ignored = self.ignored_all();
+                                if !ignored.is_empty() {
+                                    let mut file = std::fs::File::create(output_path)?;
+                                    for typo in ignored {
+                                        writeln!(file, "{}", typo)?;
+                                    }
+                                }
+                            }
                             std::process::exit(0);
                         }
                     }

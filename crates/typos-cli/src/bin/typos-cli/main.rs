@@ -39,20 +39,7 @@ fn run() -> proc_exit::ExitResult {
     } else if args.type_list {
         run_type_list(&args)
     } else {
-        let result = run_checks(&args);
-        if let (Ok(_), Some(output_path)) = (&result, args.dump_ignores.as_ref()) {
-            // This is gross but we need to extract the `InteractiveChecker` from the `FileChecker`
-            // trait object.
-            let checker = typos_cli::file::InteractiveChecker::default();
-            let ignored = checker.ignored_all();
-            if !ignored.is_empty() {
-                let mut file = std::fs::File::create(output_path).to_sysexits()?;
-                for typo in ignored {
-                    writeln!(file, "{}", typo).to_sysexits()?;
-                }
-            }
-        }
-        result
+        run_checks(&args)
     }
 }
 
@@ -158,6 +145,7 @@ fn run_type_list(args: &args::Args) -> proc_exit::ExitResult {
     Ok(())
 }
 
+#[allow(unused_assignments)]
 fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
     let global_cwd = std::env::current_dir()
         .map_err(|err| {
@@ -243,7 +231,7 @@ fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
             .with_code(proc_exit::sysexits::CONFIG_ERR)?;
         let walk_policy = engine.walk(&cwd);
 
-        let threads = if path.is_file() || args.sort || args.interactive {
+        let threads = if path.is_file() || args.sort {
             1
         } else {
             args.threads
@@ -313,8 +301,6 @@ fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
             &typos_cli::file::FixTypos
         } else if args.diff {
             &typos_cli::file::DiffTypos
-        } else if args.interactive {
-            &typos_cli::file::InteractiveChecker::default()
         } else {
             &typos_cli::file::Typos
         };
