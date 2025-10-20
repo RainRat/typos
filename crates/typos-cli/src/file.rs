@@ -215,6 +215,8 @@ impl FileChecker for InteractiveChecker {
                     match action {
                         Action::Fix(correction) => {
                             let mut typo = typo.into_owned();
+                            let correction =
+                                crate::case::to_same_case(typo.typo.as_ref(), &correction);
                             typo.corrections = typos::Status::Corrections(vec![correction.into()]);
                             fixes.push(typo);
                         }
@@ -255,7 +257,7 @@ impl FileChecker for InteractiveChecker {
                 let mut typo_it = typos.into_iter().peekable();
                 let mut accum_line_num = AccumulateLineNum::new();
                 while let Some(typo) = typo_it.next() {
-                     if self
+                    if self
                         .ignore_list
                         .lock()
                         .unwrap()
@@ -278,6 +280,8 @@ impl FileChecker for InteractiveChecker {
                     match action {
                         Action::Fix(correction) => {
                             let mut typo = typo.into_owned();
+                            let correction =
+                                crate::case::to_same_case(typo.typo.as_ref(), &correction);
                             typo.corrections = typos::Status::Corrections(vec![correction.into()]);
                             fixes.push(typo);
                         }
