@@ -141,20 +141,26 @@ impl FileChecker for FixTypos {
     }
 }
 
-use std::io::IsTerminal;
-
 #[derive(Debug)]
 pub struct InteractiveChecker {
     ignore_list: std::sync::Mutex<std::collections::HashSet<String>>,
     interactive: bool,
+    tty: Option<std::sync::Mutex<std::io::BufReader<std::fs::File>>>,
+}
+
+fn open_tty() -> Option<std::sync::Mutex<std::io::BufReader<std::fs::File>>> {
+    std::fs::File::open("/dev/tty")
+        .ok()
+        .map(|f| std::sync::Mutex::new(std::io::BufReader::new(f)))
 }
 
 impl Default for InteractiveChecker {
     fn default() -> Self {
+        use std::io::IsTerminal as _;
         Self {
             ignore_list: Default::default(),
-            // Only allow interactive mode if both ends are ttys
-            interactive: std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+            interactive: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+            tty: open_tty(),
         }
     }
 }
@@ -167,9 +173,9 @@ impl FileChecker for InteractiveChecker {
         policy: &crate::policy::Policy<'_, '_, '_>,
         reporter: &dyn report::Report,
     ) -> Result<(), std::io::Error> {
-        // If not actually interactive (e.g., CI, piping, or reading from "-"),
-        // degrade gracefully to non-interactive reporting.
-        if !self.interactive || path == std::path::Path::new("-") {
+        // If not actually interactive (e.g., CI, piping), degrade gracefully to
+        // non-interactive reporting.
+        if !self.interactive {
             return Typos.check_file(path, explicit, policy, reporter);
         }
         if policy.check_filenames {
@@ -293,24 +299,36 @@ impl InteractiveChecker {
         reporter.report(msg.clone().into())?;
 
         let corrections = if let typos::Status::Corrections(ref c) = msg.corrections {
-            c.as_slice()
+            c.iter()
+                .flat_map(|s| s.split(", "))
+                .collect::<Vec<_>>()
         } else {
-            &[]
+            Vec::new()
         };
 
         loop {
             let mut options = String::new();
             for (i, correction) in corrections.iter().enumerate() {
                 use std::fmt::Write;
-                write!(&mut options, ", {}: fix as `{}`", i + 1, correction).unwrap();
+                write!(&mut options, ", [{}]: fix as `{}`", i + 1, correction).unwrap();
             }
             // Print prompts to stderr so they appear even when stdout is redirected
             use std::io::Write as _;
             let mut err = std::io::stderr();
             write!(err, "What to do? [i]gnore, ignore [a]ll, [s]kip file{}? ", options)?;
             err.flush()?;
+
+            use std::io::BufRead;
             let mut input = String::new();
-            if std::io::stdin().read_line(&mut input)? == 0 {
+            let read_n = if let Some(tty) = &self.tty {
+                let mut tty = tty.lock().unwrap();
+                input.clear();
+                tty.read_line(&mut input)?
+            } else {
+                std::io::stdin().read_line(&mut input)?
+            };
+
+            if read_n == 0 {
                 // EOF in non-tty contexts → don't prompt per-typo; just ignore this one
                 return Ok(Action::Ignore);
             }
