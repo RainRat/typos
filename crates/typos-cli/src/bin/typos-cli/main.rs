@@ -239,7 +239,7 @@ fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
             .with_code(proc_exit::sysexits::CONFIG_ERR)?;
         let walk_policy = engine.walk(&cwd);
 
-        let threads = if path.is_file() || args.sort {
+        let threads = if path.is_file() || args.sort || args.interactive {
             1
         } else {
             args.threads

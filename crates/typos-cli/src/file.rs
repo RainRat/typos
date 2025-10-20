@@ -422,7 +422,7 @@ impl InteractiveChecker {
             } else if choice == "q" {
                 return Ok(Action::Quit);
             } else if let Ok(idx) = choice.parse::<usize>() {
-                if 1 <= idx && idx <= corrections.len() {
+                if idx > 0 && idx <= corrections.len() {
                     return Ok(Action::Fix(corrections[idx - 1].to_string()));
                 }
             }
