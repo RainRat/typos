@@ -66,6 +66,13 @@ impl FileChecker for Typos {
     }
 }
 
+impl InteractiveChecker {
+    pub fn ignored_all(&self) -> Vec<String> {
+        let ignored = self.ignored_all.lock().unwrap();
+        ignored.iter().cloned().collect()
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct FixTypos;
 
@@ -144,6 +151,7 @@ impl FileChecker for FixTypos {
 #[derive(Debug)]
 pub struct InteractiveChecker {
     ignore_list: std::sync::Mutex<std::collections::HashSet<String>>,
+    ignored_all: std::sync::Mutex<std::collections::HashSet<String>>,
     interactive: bool,
     tty: Option<std::sync::Mutex<std::io::BufReader<std::fs::File>>>,
 }
@@ -159,6 +167,7 @@ impl Default for InteractiveChecker {
         use std::io::IsTerminal as _;
         Self {
             ignore_list: Default::default(),
+            ignored_all: Default::default(),
             interactive: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
             tty: open_tty(),
         }
@@ -207,6 +216,7 @@ impl FileChecker for InteractiveChecker {
                         Action::Ignore => {}
                         Action::IgnoreAll => {
                             self.ignore_list.lock().unwrap().insert(typo.typo.to_string());
+                            self.ignored_all.lock().unwrap().insert(typo.typo.to_string());
                         }
                         Action::SkipFile => {
                             return Ok(());
@@ -260,6 +270,7 @@ impl FileChecker for InteractiveChecker {
                         Action::Ignore => {}
                         Action::IgnoreAll => {
                             self.ignore_list.lock().unwrap().insert(typo.typo.to_string());
+                            self.ignored_all.lock().unwrap().insert(typo.typo.to_string());
                         }
                         Action::SkipFile => {
                             // Can't just return, need to write out previous fixes

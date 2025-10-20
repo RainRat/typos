@@ -39,7 +39,20 @@ fn run() -> proc_exit::ExitResult {
     } else if args.type_list {
         run_type_list(&args)
     } else {
-        run_checks(&args)
+        let result = run_checks(&args);
+        if let (Ok(_), Some(output_path)) = (&result, args.dump_ignores.as_ref()) {
+            // This is gross but we need to extract the `InteractiveChecker` from the `FileChecker`
+            // trait object.
+            let checker = typos_cli::file::InteractiveChecker::default();
+            let ignored = checker.ignored_all();
+            if !ignored.is_empty() {
+                let mut file = std::fs::File::create(output_path).to_sysexits()?;
+                for typo in ignored {
+                    writeln!(file, "{}", typo).to_sysexits()?;
+                }
+            }
+        }
+        result
     }
 }
 

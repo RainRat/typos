@@ -101,6 +101,10 @@ pub(crate) struct Args {
     #[arg(long, group = "mode", help_heading = "Mode")]
     pub(crate) dump_config: Option<std::path::PathBuf>,
 
+    /// Write all ignored typos to a file
+    #[arg(long, help_heading = "Mode")]
+    pub(crate) dump_ignores: Option<std::path::PathBuf>,
+
     /// Show all supported file types.
     #[arg(long, group = "mode", help_heading = "Mode")]
     pub(crate) type_list: bool,
