@@ -292,11 +292,10 @@ impl InteractiveChecker {
     ) -> Result<Action, std::io::Error> {
         reporter.report(msg.clone().into())?;
 
-        let corrections = match msg.corrections {
-            typos::Status::Corrections(ref c) => c,
-            _ => {
-                return Ok(Action::Ignore);
-            }
+        let corrections = if let typos::Status::Corrections(ref c) = msg.corrections {
+            c.as_slice()
+        } else {
+            &[]
         };
 
         loop {
