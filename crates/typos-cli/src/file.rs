@@ -193,7 +193,12 @@ impl FileChecker for InteractiveChecker {
                 let typos: Vec<_> = check_str(file_name, policy).collect();
                 let mut typo_it = typos.into_iter().peekable();
                 while let Some(typo) = typo_it.next() {
-                    if self.ignore_list.lock().unwrap().contains(typo.typo.as_ref()) {
+                    if self
+                        .ignore_list
+                        .lock()
+                        .unwrap()
+                        .contains(&typo.typo.as_ref().to_lowercase())
+                    {
                         continue;
                     }
 
@@ -215,8 +220,9 @@ impl FileChecker for InteractiveChecker {
                         }
                         Action::Ignore => {}
                         Action::IgnoreAll => {
-                            self.ignore_list.lock().unwrap().insert(typo.typo.to_string());
-                            self.ignored_all.lock().unwrap().insert(typo.typo.to_string());
+                            let typo_str = typo.typo.as_ref().to_lowercase();
+                            self.ignore_list.lock().unwrap().insert(typo_str.clone());
+                            self.ignored_all.lock().unwrap().insert(typo_str);
                         }
                         Action::SkipFile => {
                             return Ok(());
@@ -246,7 +252,12 @@ impl FileChecker for InteractiveChecker {
                 let mut typo_it = typos.into_iter().peekable();
                 let mut accum_line_num = AccumulateLineNum::new();
                 while let Some(typo) = typo_it.next() {
-                     if self.ignore_list.lock().unwrap().contains(typo.typo.as_ref()) {
+                     if self
+                        .ignore_list
+                        .lock()
+                        .unwrap()
+                        .contains(&typo.typo.as_ref().to_lowercase())
+                    {
                         continue;
                     }
 
@@ -269,8 +280,9 @@ impl FileChecker for InteractiveChecker {
                         }
                         Action::Ignore => {}
                         Action::IgnoreAll => {
-                            self.ignore_list.lock().unwrap().insert(typo.typo.to_string());
-                            self.ignored_all.lock().unwrap().insert(typo.typo.to_string());
+                            let typo_str = typo.typo.as_ref().to_lowercase();
+                            self.ignore_list.lock().unwrap().insert(typo_str.clone());
+                            self.ignored_all.lock().unwrap().insert(typo_str);
                         }
                         Action::SkipFile => {
                             // Can't just return, need to write out previous fixes
