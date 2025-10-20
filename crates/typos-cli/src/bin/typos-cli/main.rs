@@ -34,6 +34,12 @@ fn run() -> proc_exit::ExitResult {
 
     init_logging(args.verbose.log_level());
 
+    use std::io::IsTerminal as _;
+    if args.interactive && !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+        eprintln!("error: --interactive requires a TTY (stdin and stderr). Try --write-changes or --diff.");
+        return proc_exit::Code::new(2).ok();
+    }
+
     if let Some(output_path) = args.dump_config.as_ref() {
         run_dump_config(&args, output_path)
     } else if args.type_list {
@@ -146,6 +152,9 @@ fn run_type_list(args: &args::Args) -> proc_exit::ExitResult {
 }
 
 fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
+    let checker = pick_checker(args);
+    let selected_checks = checker.as_ref();
+
     let global_cwd = std::env::current_dir()
         .map_err(|err| {
             let kind = err.kind();
@@ -170,6 +179,7 @@ fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
 
     let mut typos_found = false;
     let mut errors_found = false;
+    let mut user_quit = false;
 
     let file_list = match args.file_list.as_deref() {
         Some(dash) if dash == PathBuf::from("-") => Some(
@@ -197,7 +207,7 @@ fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
     };
 
     // Note: file_list and args.path are mutually exclusive, enforced by clap
-    'path: for path in file_list.as_ref().unwrap_or(&args.path) {
+    'paths: for path in file_list.as_ref().unwrap_or(&args.path) {
         // Note paths are passed through stdin, `-` is treated like a normal path
         let cwd = if path == std::path::Path::new("-") {
             if args.file_list.is_some() {
@@ -230,7 +240,7 @@ fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
             .with_code(proc_exit::sysexits::CONFIG_ERR)?;
         let walk_policy = engine.walk(&cwd);
 
-        let threads = if path.is_file() || args.sort {
+        let threads = if path.is_file() || args.sort || args.interactive {
             1
         } else {
             args.threads
@@ -263,7 +273,7 @@ fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
                 for path in ancestors {
                     match ignores.matched(path, path.is_dir()) {
                         ignore::Match::None => {}
-                        ignore::Match::Ignore(_) => continue 'path,
+                        ignore::Match::Ignore(_) => continue 'paths,
                         ignore::Match::Whitelist(_) => break,
                     }
                 }
@@ -284,27 +294,7 @@ fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
         let status_reporter = report::MessageStatus::new(global_reporter.as_ref());
         let reporter: &dyn Report = &status_reporter;
 
-        let selected_checks: &dyn typos_cli::file::FileChecker = if args.files {
-            &typos_cli::file::FoundFiles
-        } else if args.file_types {
-            &typos_cli::file::FileTypes
-        } else if args.highlight_identifiers {
-            &typos_cli::file::HighlightIdentifiers
-        } else if args.identifiers {
-            &typos_cli::file::Identifiers
-        } else if args.highlight_words {
-            &typos_cli::file::HighlightWords
-        } else if args.words {
-            &typos_cli::file::Words
-        } else if args.write_changes {
-            &typos_cli::file::FixTypos
-        } else if args.diff {
-            &typos_cli::file::DiffTypos
-        } else {
-            &typos_cli::file::Typos
-        };
-
-        if single_threaded {
+        let result = if single_threaded {
             typos_cli::file::walk_path(
                 walk.build(),
                 selected_checks,
@@ -320,18 +310,31 @@ fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
                 reporter,
                 args.force_exclude,
             )
+        };
+
+        match result {
+            Ok(()) => {}
+            Err(e) => {
+                if let Some(io_err) = e.io_error() {
+                    if io_err.kind() == std::io::ErrorKind::Interrupted {
+                        user_quit = true;
+                        break 'paths;
+                    }
+                }
+                let exit = e
+                    .io_error()
+                    .map(|i| {
+                        let kind = i.kind();
+                        proc_exit::sysexits::io_to_sysexists(kind)
+                            .or_else(|| proc_exit::bash::io_to_signal(kind))
+                            .unwrap_or(proc_exit::sysexits::IO_ERR)
+                    })
+                    .unwrap_or_default()
+                    .with_message(e);
+                return Err(exit);
+            }
         }
-        .map_err(|e| {
-            e.io_error()
-                .map(|i| {
-                    let kind = i.kind();
-                    proc_exit::sysexits::io_to_sysexists(kind)
-                        .or_else(|| proc_exit::bash::io_to_signal(kind))
-                        .unwrap_or(proc_exit::sysexits::IO_ERR)
-                })
-                .unwrap_or_default()
-                .with_message(e)
-        })?;
+
         if status_reporter.typos_found() {
             typos_found = true;
         }
@@ -345,10 +348,19 @@ fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
         log::error!("could not render end-report: {err}");
     }
 
+    if let Err(err) = selected_checks.finalize() {
+        errors_found = true;
+        log::error!("could not finalize: {err}");
+    }
+
+    if user_quit {
+        return proc_exit::Code::SUCCESS.ok();
+    }
+
     if errors_found {
         proc_exit::Code::FAILURE.ok()
     } else if typos_found {
-        // Can;'t use `Failure` since its so prevalent, it could be easy to get a
+        // Can't use `Failure` since its so prevalent, it could be easy to get a
         // `Failure` from something else and get it mixed up with typos.
         //
         // Can't use DataErr or anything else an std::io::ErrorKind might map to.
@@ -356,6 +368,39 @@ fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
     } else {
         proc_exit::Code::SUCCESS.ok()
     }
+}
+
+fn pick_checker(args: &args::Args) -> Box<dyn typos_cli::file::FileChecker> {
+    if args.interactive {
+        let mut ic = typos_cli::file::InteractiveChecker::default();
+        ic.dump_ignores = args.dump_ignores.clone();
+        return Box::new(ic);
+    }
+    if args.diff {
+        return Box::new(typos_cli::file::DiffTypos);
+    }
+    if args.write_changes {
+        return Box::new(typos_cli::file::FixTypos);
+    }
+    if args.files {
+        return Box::new(typos_cli::file::FoundFiles);
+    }
+    if args.file_types {
+        return Box::new(typos_cli::file::FileTypes);
+    }
+    if args.highlight_identifiers {
+        return Box::new(typos_cli::file::HighlightIdentifiers);
+    }
+    if args.identifiers {
+        return Box::new(typos_cli::file::Identifiers);
+    }
+    if args.highlight_words {
+        return Box::new(typos_cli::file::HighlightWords);
+    }
+    if args.words {
+        return Box::new(typos_cli::file::Words);
+    }
+    Box::new(typos_cli::file::Typos)
 }
 
 fn init_logging(level: Option<log::Level>) {
