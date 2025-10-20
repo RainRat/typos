@@ -141,9 +141,22 @@ impl FileChecker for FixTypos {
     }
 }
 
-#[derive(Debug, Default)]
+use std::io::IsTerminal;
+
+#[derive(Debug)]
 pub struct InteractiveChecker {
     ignore_list: std::sync::Mutex<std::collections::HashSet<String>>,
+    interactive: bool,
+}
+
+impl Default for InteractiveChecker {
+    fn default() -> Self {
+        Self {
+            ignore_list: Default::default(),
+            // Only allow interactive mode if both ends are ttys
+            interactive: std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+        }
+    }
 }
 
 impl FileChecker for InteractiveChecker {
@@ -154,6 +167,11 @@ impl FileChecker for InteractiveChecker {
         policy: &crate::policy::Policy<'_, '_, '_>,
         reporter: &dyn report::Report,
     ) -> Result<(), std::io::Error> {
+        // If not actually interactive (e.g., CI, piping, or reading from "-"),
+        // degrade gracefully to non-interactive reporting.
+        if !self.interactive || path == std::path::Path::new("-") {
+            return Typos.check_file(path, explicit, policy, reporter);
+        }
         if policy.check_filenames {
             if let Some(file_name) = path.file_name().and_then(|s| s.to_str()) {
                 let mut fixes = Vec::new();
@@ -287,18 +305,22 @@ impl InteractiveChecker {
                 use std::fmt::Write;
                 write!(&mut options, ", {}: fix as `{}`", i + 1, correction).unwrap();
             }
-            print!(
-                "What to do? [i]gnore, ignore [a]ll, [s]kip file{}? ",
-                options
-            );
-            std::io::stdout().flush()?;
+            // Print prompts to stderr so they appear even when stdout is redirected
+            use std::io::Write as _;
+            let mut err = std::io::stderr();
+            write!(err, "What to do? [i]gnore, ignore [a]ll, [s]kip file{}? ", options)?;
+            err.flush()?;
             let mut input = String::new();
             if std::io::stdin().read_line(&mut input)? == 0 {
-                // EOF, assume user wants to exit.
-                return Ok(Action::SkipFile);
+                // EOF in non-tty contexts → don't prompt per-typo; just ignore this one
+                return Ok(Action::Ignore);
             }
             let choice = input.trim();
 
+            if choice.is_empty() {
+                // Hitting ENTER defaults to ignore
+                return Ok(Action::Ignore);
+            }
             if choice == "i" {
                 return Ok(Action::Ignore);
             } else if choice == "a" {
@@ -310,7 +332,7 @@ impl InteractiveChecker {
                     return Ok(Action::Fix(corrections[idx - 1].to_string()));
                 }
             }
-            println!("Invalid choice: {}", choice);
+            writeln!(std::io::stderr(), "Invalid choice: {}", choice)?;
         }
     }
 }
