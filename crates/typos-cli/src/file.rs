@@ -4,7 +4,11 @@ use std::io::Write;
 
 use crate::report;
 
+use std::any::Any;
+
 pub trait FileChecker: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+
     fn check_file(
         &self,
         path: &std::path::Path,
@@ -18,6 +22,10 @@ pub trait FileChecker: Send + Sync {
 pub struct Typos;
 
 impl FileChecker for Typos {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn check_file(
         &self,
         path: &std::path::Path,
@@ -71,12 +79,29 @@ impl InteractiveChecker {
         let ignored = self.ignored_all.lock().unwrap();
         ignored.iter().cloned().collect()
     }
+
+    pub fn write_ignored(&self) -> std::io::Result<()> {
+        if let Some(output_path) = &self.dump_ignores {
+            let set = self.ignored_all.lock().unwrap();
+            if !set.is_empty() {
+                let mut file = std::fs::File::create(output_path)?;
+                for typo in set.iter() {
+                    writeln!(file, "{}", typo)?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct FixTypos;
 
 impl FileChecker for FixTypos {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn check_file(
         &self,
         path: &std::path::Path,
@@ -177,6 +202,10 @@ impl Default for InteractiveChecker {
 }
 
 impl FileChecker for InteractiveChecker {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn check_file(
         &self,
         path: &std::path::Path,
@@ -232,16 +261,10 @@ impl FileChecker for InteractiveChecker {
                             return Ok(());
                         }
                         Action::Quit => {
-                            if let Some(output_path) = self.dump_ignores.as_ref() {
-                                let ignored = self.ignored_all();
-                                if !ignored.is_empty() {
-                                    let mut file = std::fs::File::create(output_path)?;
-                                    for typo in ignored {
-                                        writeln!(file, "{}", typo)?;
-                                    }
-                                }
-                            }
-                            std::process::exit(0);
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                "user-quit",
+                            ));
                         }
                     }
                 }
@@ -311,16 +334,10 @@ impl FileChecker for InteractiveChecker {
                             break;
                         }
                         Action::Quit => {
-                            if let Some(output_path) = self.dump_ignores.as_ref() {
-                                let ignored = self.ignored_all();
-                                if !ignored.is_empty() {
-                                    let mut file = std::fs::File::create(output_path)?;
-                                    for typo in ignored {
-                                        writeln!(file, "{}", typo)?;
-                                    }
-                                }
-                            }
-                            std::process::exit(0);
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                "user-quit",
+                            ));
                         }
                     }
                 }
@@ -418,6 +435,10 @@ impl InteractiveChecker {
 pub struct DiffTypos;
 
 impl FileChecker for DiffTypos {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn check_file(
         &self,
         path: &std::path::Path,
@@ -522,6 +543,10 @@ impl FileChecker for DiffTypos {
 pub struct HighlightIdentifiers;
 
 impl FileChecker for HighlightIdentifiers {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn check_file(
         &self,
         path: &std::path::Path,
@@ -629,6 +654,10 @@ impl FileChecker for HighlightIdentifiers {
 pub struct Identifiers;
 
 impl FileChecker for Identifiers {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn check_file(
         &self,
         path: &std::path::Path,
@@ -691,6 +720,10 @@ impl FileChecker for Identifiers {
 pub struct HighlightWords;
 
 impl FileChecker for HighlightWords {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn check_file(
         &self,
         path: &std::path::Path,
@@ -809,6 +842,10 @@ static UNMATCHED: anstyle::Style = anstyle::Style::new().effects(anstyle::Effect
 pub struct Words;
 
 impl FileChecker for Words {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn check_file(
         &self,
         path: &std::path::Path,
@@ -879,6 +916,10 @@ impl FileChecker for Words {
 pub struct FileTypes;
 
 impl FileChecker for FileTypes {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn check_file(
         &self,
         path: &std::path::Path,
@@ -909,6 +950,10 @@ impl FileChecker for FileTypes {
 pub struct FoundFiles;
 
 impl FileChecker for FoundFiles {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn check_file(
         &self,
         path: &std::path::Path,

@@ -145,7 +145,6 @@ fn run_type_list(args: &args::Args) -> proc_exit::ExitResult {
     Ok(())
 }
 
-#[allow(unused_assignments)]
 fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
     let global_cwd = std::env::current_dir()
         .map_err(|err| {
