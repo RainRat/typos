@@ -300,6 +300,8 @@ fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
             &typos_cli::file::FixTypos
         } else if args.diff {
             &typos_cli::file::DiffTypos
+        } else if args.interactive {
+            &typos_cli::file::InteractiveChecker::default()
         } else {
             &typos_cli::file::Typos
         };
