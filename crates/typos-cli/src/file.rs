@@ -293,7 +293,10 @@ impl InteractiveChecker {
             );
             std::io::stdout().flush()?;
             let mut input = String::new();
-            std::io::stdin().read_line(&mut input)?;
+            if std::io::stdin().read_line(&mut input)? == 0 {
+                // EOF, assume user wants to exit.
+                return Ok(Action::SkipFile);
+            }
             let choice = input.trim();
 
             if choice == "i" {
