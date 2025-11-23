@@ -173,13 +173,26 @@ impl FileChecker for FixTypos {
     }
 }
 
-#[derive(Debug)]
 pub struct InteractiveChecker {
     ignore_list: std::sync::Mutex<std::collections::HashSet<String>>,
     ignored_all: std::sync::Mutex<std::collections::HashSet<String>>,
     interactive: bool,
     tty: Option<std::sync::Mutex<std::io::BufReader<std::fs::File>>>,
     pub dump_ignores: Option<std::path::PathBuf>,
+    stdin_override: Option<std::sync::Arc<std::sync::Mutex<dyn std::io::BufRead + Send + Sync>>>,
+    stderr_override: Option<std::sync::Arc<std::sync::Mutex<dyn Write + Send + Sync>>>,
+}
+
+impl std::fmt::Debug for InteractiveChecker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InteractiveChecker")
+            .field("ignore_list", &self.ignore_list)
+            .field("ignored_all", &self.ignored_all)
+            .field("interactive", &self.interactive)
+            .field("tty", &self.tty)
+            .field("dump_ignores", &self.dump_ignores)
+            .finish_non_exhaustive()
+    }
 }
 
 fn open_tty() -> Option<std::sync::Mutex<std::io::BufReader<std::fs::File>>> {
@@ -197,6 +210,8 @@ impl Default for InteractiveChecker {
             interactive: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
             tty: open_tty(),
             dump_ignores: None,
+            stdin_override: None,
+            stderr_override: None,
         }
     }
 }
@@ -218,68 +233,6 @@ impl FileChecker for InteractiveChecker {
         if !self.interactive {
             return Typos.check_file(path, explicit, policy, reporter);
         }
-        if policy.check_filenames {
-            if let Some(file_name) = path.file_name().and_then(|s| s.to_str()) {
-                let mut fixes = Vec::new();
-                let typos: Vec<_> = check_str(file_name, policy).collect();
-                let mut typo_it = typos.into_iter().peekable();
-                while let Some(typo) = typo_it.next() {
-                    if self
-                        .ignore_list
-                        .lock()
-                        .unwrap()
-                        .contains(&typo.typo.as_ref().to_lowercase())
-                    {
-                        continue;
-                    }
-
-                    let (_line, line_offset) = extract_line(file_name.as_bytes(), typo.byte_offset);
-                    let msg = report::Typo {
-                        context: Some(report::PathContext { path }.into()),
-                        buffer: std::borrow::Cow::Borrowed(file_name.as_bytes()),
-                        byte_offset: line_offset,
-                        typo: typo.typo.as_ref(),
-                        corrections: typo.corrections.clone(),
-                    };
-                    let action = self.prompt_user(msg, reporter)?;
-
-                    match action {
-                        Action::Fix(correction) => {
-                            let mut typo = typo.into_owned();
-                            let correction =
-                                crate::case::to_same_case(typo.typo.as_ref(), &correction);
-                            typo.corrections = typos::Status::Corrections(vec![correction.into()]);
-                            fixes.push(typo);
-                        }
-                        Action::Ignore => {}
-                        Action::IgnoreAll => {
-                            let typo_str = typo.typo.as_ref().to_lowercase();
-                            self.ignore_list.lock().unwrap().insert(typo_str.clone());
-                            self.ignored_all.lock().unwrap().insert(typo_str);
-                        }
-                        Action::SkipFile => {
-                            return Ok(());
-                        }
-                        Action::Quit => {
-                            return Err(std::io::Error::new(
-                                std::io::ErrorKind::Interrupted,
-                                "user-quit",
-                            ));
-                        }
-                    }
-                }
-
-                if !fixes.is_empty() {
-                    let file_name = file_name.to_owned().into_bytes();
-                    let new_name = fix_buffer(file_name, fixes.into_iter());
-                    let new_name =
-                        String::from_utf8(new_name).expect("corrections are valid utf-8");
-                    let new_path = path.with_file_name(new_name);
-                    std::fs::rename(path, new_path)?;
-                }
-            }
-        }
-
         if policy.check_files {
             let (buffer, content_type) = read_file(path, reporter)?;
             if !explicit && !policy.binary && content_type.is_binary() {
@@ -349,6 +302,68 @@ impl FileChecker for InteractiveChecker {
             }
         }
 
+        if policy.check_filenames {
+            if let Some(file_name) = path.file_name().and_then(|s| s.to_str()) {
+                let mut fixes = Vec::new();
+                let typos: Vec<_> = check_str(file_name, policy).collect();
+                let mut typo_it = typos.into_iter().peekable();
+                while let Some(typo) = typo_it.next() {
+                    if self
+                        .ignore_list
+                        .lock()
+                        .unwrap()
+                        .contains(&typo.typo.as_ref().to_lowercase())
+                    {
+                        continue;
+                    }
+
+                    let (_line, line_offset) = extract_line(file_name.as_bytes(), typo.byte_offset);
+                    let msg = report::Typo {
+                        context: Some(report::PathContext { path }.into()),
+                        buffer: std::borrow::Cow::Borrowed(file_name.as_bytes()),
+                        byte_offset: line_offset,
+                        typo: typo.typo.as_ref(),
+                        corrections: typo.corrections.clone(),
+                    };
+                    let action = self.prompt_user(msg, reporter)?;
+
+                    match action {
+                        Action::Fix(correction) => {
+                            let mut typo = typo.into_owned();
+                            let correction =
+                                crate::case::to_same_case(typo.typo.as_ref(), &correction);
+                            typo.corrections = typos::Status::Corrections(vec![correction.into()]);
+                            fixes.push(typo);
+                        }
+                        Action::Ignore => {}
+                        Action::IgnoreAll => {
+                            let typo_str = typo.typo.as_ref().to_lowercase();
+                            self.ignore_list.lock().unwrap().insert(typo_str.clone());
+                            self.ignored_all.lock().unwrap().insert(typo_str);
+                        }
+                        Action::SkipFile => {
+                            return Ok(());
+                        }
+                        Action::Quit => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                "user-quit",
+                            ));
+                        }
+                    }
+                }
+
+                if !fixes.is_empty() {
+                    let file_name = file_name.to_owned().into_bytes();
+                    let new_name = fix_buffer(file_name, fixes.into_iter());
+                    let new_name =
+                        String::from_utf8(new_name).expect("corrections are valid utf-8");
+                    let new_path = path.with_file_name(new_name);
+                    std::fs::rename(path, new_path)?;
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -385,17 +400,30 @@ impl InteractiveChecker {
             }
             // Print prompts to stderr so they appear even when stdout is redirected
             use std::io::Write as _;
-            let mut err = std::io::stderr();
-            write!(
-                err,
-                "What to do? [i]gnore, ignore [a]ll, [s]kip file, [q]uit{}? ",
-                options
-            )?;
-            err.flush()?;
+            if let Some(stderr) = &self.stderr_override {
+                let mut err = stderr.lock().unwrap();
+                write!(
+                    err,
+                    "What to do? [i]gnore, ignore [a]ll, [s]kip file, [q]uit{}? ",
+                    options
+                )?;
+                err.flush()?;
+            } else {
+                let mut err = std::io::stderr();
+                write!(
+                    err,
+                    "What to do? [i]gnore, ignore [a]ll, [s]kip file, [q]uit{}? ",
+                    options
+                )?;
+                err.flush()?;
+            }
 
             use std::io::BufRead;
             let mut input = String::new();
-            let read_n = if let Some(tty) = &self.tty {
+            let read_n = if let Some(stdin) = &self.stdin_override {
+                let mut stdin = stdin.lock().unwrap();
+                stdin.read_line(&mut input)?
+            } else if let Some(tty) = &self.tty {
                 let mut tty = tty.lock().unwrap();
                 input.clear();
                 tty.read_line(&mut input)?
@@ -1479,3 +1507,72 @@ mod test {
         assert_eq!(line[offset], buffer[buffer_offset]);
     }
 }
+
+    #[test]
+    fn test_interactive_rename_order() {
+        // This test verifies that if a file is renamed by the interactive checker,
+        // the subsequent file content check does not crash due to file not found.
+        // This reproduces the reported bug where filename check ran before file content check.
+
+        // Setup file system
+        let temp_dir = assert_fs::TempDir::new().unwrap();
+        let file_name = "teh.txt";
+        let file_path = temp_dir.path().join(file_name);
+        std::fs::write(&file_path, "content").unwrap();
+
+        // Input: Select "1" (fix) for the filename typo.
+        // "teh" should be corrected to "the".
+        let input = b"1\n";
+        let stdin = std::sync::Arc::new(std::sync::Mutex::new(std::io::Cursor::new(input)));
+
+        // Sink for stderr
+        let stderr = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // Setup checker
+        let checker = InteractiveChecker {
+            ignore_list: Default::default(),
+            ignored_all: Default::default(),
+            interactive: true,
+            tty: None,
+            dump_ignores: None,
+            stdin_override: Some(stdin),
+            stderr_override: Some(stderr),
+        };
+
+        // Setup Policy
+        let mut policy = crate::policy::Policy::default();
+        policy.check_filenames = true;
+        policy.check_files = true;
+
+        // Setup Reporter
+        struct TestReporter {
+            messages: std::sync::Mutex<Vec<String>>,
+        }
+        impl report::Report for TestReporter {
+            fn report(&self, msg: report::Message<'_>) -> Result<(), std::io::Error> {
+                if let report::Message::Error(e) = msg {
+                    self.messages.lock().unwrap().push(e.msg);
+                }
+                Ok(())
+            }
+        }
+        let reporter = TestReporter { messages: std::sync::Mutex::new(Vec::new()) };
+
+        // Run check
+        // Expected behavior with bug:
+        // 1. check_filenames runs, prompts user, user says fix.
+        // 2. File is renamed to "the.txt".
+        // 3. check_files runs on "teh.txt", fails because file does not exist.
+
+        let result = checker.check_file(&file_path, false, &policy, &reporter);
+
+        assert!(result.is_ok(), "check_file failed: {:?}", result.err());
+
+        // Verify rename happened
+        assert!(!file_path.exists());
+        assert!(temp_dir.path().join("the.txt").exists());
+
+        // Verify NO error was reported
+        let messages = reporter.messages.lock().unwrap();
+        assert!(messages.is_empty(), "Expected no error message, but got: {:?}", messages);
+    }
