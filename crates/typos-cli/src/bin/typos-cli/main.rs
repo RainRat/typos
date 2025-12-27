@@ -5,6 +5,7 @@ use clap::Parser;
 
 mod args;
 mod report;
+mod report_dump;
 
 use proc_exit::prelude::*;
 
@@ -291,7 +292,13 @@ fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
         }
 
         let status_reporter = report::MessageStatus::new(global_reporter.as_ref());
-        let reporter: &dyn Report = &status_reporter;
+        let mut dump_reporter = (!args.interactive)
+            .then(|| report_dump::DumpIgnoresReporter::new(&status_reporter));
+        let reporter: &dyn Report = if let Some(dump_reporter) = dump_reporter.as_ref() {
+            dump_reporter
+        } else {
+            &status_reporter
+        };
 
         if single_threaded {
             typos_cli::file::walk_path(
@@ -326,6 +333,15 @@ fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
         }
         if status_reporter.errors_found() {
             errors_found = true;
+        }
+
+        if let Some(dump_reporter) = dump_reporter.take() {
+            if let Some(output_path) = args.dump_ignores.as_ref() {
+                if let Err(err) = dump_reporter.dump(output_path) {
+                    errors_found = true;
+                    log::error!("could not write ignored typos: {err}");
+                }
+            }
         }
     }
 
