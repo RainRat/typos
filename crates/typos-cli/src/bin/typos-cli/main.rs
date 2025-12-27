@@ -293,7 +293,7 @@ fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
         let status_reporter = report::MessageStatus::new(global_reporter.as_ref());
         let reporter: &dyn Report = &status_reporter;
 
-        if single_threaded {
+        let walk_result = if single_threaded {
             typos_cli::file::walk_path(
                 walk.build(),
                 selected_checks,
@@ -309,8 +309,18 @@ fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
                 reporter,
                 args.force_exclude,
             )
+        };
+
+        if let Some(interactive_checker) =
+            checker.as_any().downcast_ref::<typos_cli::file::InteractiveChecker>()
+        {
+            if let Err(err) = interactive_checker.write_ignored() {
+                errors_found = true;
+                log::error!("could not write ignored typos: {err}");
+            }
         }
-        .map_err(|e| {
+
+        walk_result.map_err(|e| {
             e.io_error()
                 .map(|i| {
                     let kind = i.kind();
@@ -321,6 +331,7 @@ fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
                 .unwrap_or_default()
                 .with_message(e)
         })?;
+
         if status_reporter.typos_found() {
             typos_found = true;
         }
@@ -332,13 +343,6 @@ fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
     if let Err(err) = global_reporter.generate_final_result() {
         errors_found = true;
         log::error!("could not render end-report: {err}");
-    }
-
-    if let Some(interactive_checker) = checker.as_any().downcast_ref::<typos_cli::file::InteractiveChecker>() {
-        if let Err(err) = interactive_checker.write_ignored() {
-            errors_found = true;
-            log::error!("could not write ignored typos: {err}");
-        }
     }
 
     if errors_found {
