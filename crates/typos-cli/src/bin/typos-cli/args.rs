@@ -70,6 +70,14 @@ pub(crate) struct Args {
     #[arg(long, short = 'w', group = "mode", help_heading = "Mode")]
     pub(crate) write_changes: bool,
 
+    /// Fix typos interactively
+    #[arg(long, group = "mode", help_heading = "Mode")]
+    pub(crate) interactive: bool,
+
+    /// Send interactive prompt requests to LLM via `OpenRouter`
+    #[arg(long, group = "mode", help_heading = "Mode")]
+    pub(crate) llm: bool,
+
     /// Debug: Print each file that would be spellchecked.
     #[arg(long, group = "mode", help_heading = "Mode")]
     pub(crate) files: bool,
@@ -97,6 +105,10 @@ pub(crate) struct Args {
     /// Write the current configuration to file with `-` for stdout
     #[arg(long, group = "mode", help_heading = "Mode")]
     pub(crate) dump_config: Option<std::path::PathBuf>,
+
+    /// Write all ignored typos to a file
+    #[arg(long, help_heading = "Mode")]
+    pub(crate) dump_ignores: Option<std::path::PathBuf>,
 
     /// Show all supported file types.
     #[arg(long, group = "mode", help_heading = "Mode")]

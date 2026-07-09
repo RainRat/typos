@@ -42,6 +42,7 @@ doc = false
 
 [dependencies]
 typos = { version = "^0.10", path = "../typos" }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
 varcon-core = { version = "^5.0.7", path = "../varcon-core" }
 typos-dict = { version = "^0.13", path = "../typos-dict", optional = true }
 typos-vars = { version = "^0.10", path = "../typos-vars", optional = true }
