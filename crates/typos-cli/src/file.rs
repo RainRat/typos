@@ -4,7 +4,11 @@ use std::io::Write;
 
 use crate::report;
 
+use std::any::Any;
+
 pub trait FileChecker: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+
     fn check_file(
         &self,
         path: &std::path::Path,
@@ -18,6 +22,10 @@ pub trait FileChecker: Send + Sync {
 pub struct Typos;
 
 impl FileChecker for Typos {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn check_file(
         &self,
         path: &std::path::Path,
@@ -66,10 +74,34 @@ impl FileChecker for Typos {
     }
 }
 
+impl InteractiveChecker {
+    pub fn ignored_all(&self) -> Vec<String> {
+        let ignored = self.ignored_all.lock().unwrap();
+        ignored.iter().cloned().collect()
+    }
+
+    pub fn write_ignored(&self) -> std::io::Result<()> {
+        if let Some(output_path) = &self.dump_ignores {
+            let set = self.ignored_all.lock().unwrap();
+            if !set.is_empty() {
+                let mut file = std::fs::File::create(output_path)?;
+                for typo in set.iter() {
+                    writeln!(file, "{}", typo)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct FixTypos;
 
 impl FileChecker for FixTypos {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn check_file(
         &self,
         path: &std::path::Path,
@@ -141,10 +173,451 @@ impl FileChecker for FixTypos {
     }
 }
 
+pub struct InteractiveChecker {
+    ignore_list: std::sync::Mutex<std::collections::HashSet<String>>,
+    ignored_all: std::sync::Mutex<std::collections::HashSet<String>>,
+    interactive: bool,
+    tty: Option<std::sync::Mutex<std::io::BufReader<std::fs::File>>>,
+    pub dump_ignores: Option<std::path::PathBuf>,
+    stdin_override: Option<std::sync::Arc<std::sync::Mutex<dyn std::io::BufRead + Send + Sync>>>,
+    stderr_override: Option<std::sync::Arc<std::sync::Mutex<dyn Write + Send + Sync>>>,
+    pub llm: bool,
+}
+
+impl std::fmt::Debug for InteractiveChecker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InteractiveChecker")
+            .field("ignore_list", &self.ignore_list)
+            .field("ignored_all", &self.ignored_all)
+            .field("interactive", &self.interactive)
+            .field("tty", &self.tty)
+            .field("dump_ignores", &self.dump_ignores)
+            .field("llm", &self.llm)
+            .finish_non_exhaustive()
+    }
+}
+
+fn open_tty() -> Option<std::sync::Mutex<std::io::BufReader<std::fs::File>>> {
+    std::fs::File::open("/dev/tty")
+        .ok()
+        .map(|f| std::sync::Mutex::new(std::io::BufReader::new(f)))
+}
+
+impl Default for InteractiveChecker {
+    fn default() -> Self {
+        use std::io::IsTerminal as _;
+        Self {
+            ignore_list: Default::default(),
+            ignored_all: Default::default(),
+            interactive: std::io::stdin().is_terminal() && std::io::stderr().is_terminal(),
+            tty: open_tty(),
+            dump_ignores: None,
+            stdin_override: None,
+            stderr_override: None,
+            llm: false,
+        }
+    }
+}
+
+impl FileChecker for InteractiveChecker {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn check_file(
+        &self,
+        path: &std::path::Path,
+        explicit: bool,
+        policy: &crate::policy::Policy<'_, '_, '_>,
+        reporter: &dyn report::Report,
+    ) -> Result<(), std::io::Error> {
+        // If not actually interactive (e.g., CI, piping), degrade gracefully to
+        // non-interactive reporting.
+        if !self.interactive {
+            return Typos.check_file(path, explicit, policy, reporter);
+        }
+        if policy.check_files {
+            let (buffer, content_type) = read_file(path, reporter)?;
+            if !explicit && !policy.binary && content_type.is_binary() {
+                let msg = report::BinaryFile { path };
+                reporter.report(msg.into())?;
+            } else {
+                let mut fixes = Vec::new();
+                let typos: Vec<_> = check_bytes(&buffer, policy).collect();
+                let mut typo_it = typos.into_iter().peekable();
+                let mut accum_line_num = AccumulateLineNum::new();
+                while let Some(typo) = typo_it.next() {
+                    if self
+                        .ignore_list
+                        .lock()
+                        .unwrap()
+                        .contains(&typo.typo.as_ref().to_lowercase())
+                    {
+                        continue;
+                    }
+
+                    let line_num = accum_line_num.line_num(&buffer, typo.byte_offset);
+                    let (line, line_offset) = extract_line(&buffer, typo.byte_offset);
+                    let msg = report::Typo {
+                        context: Some(report::FileContext { path, line_num }.into()),
+                        buffer: std::borrow::Cow::Borrowed(line),
+                        byte_offset: line_offset,
+                        typo: typo.typo.as_ref(),
+                        corrections: typo.corrections.clone(),
+                    };
+                    let action = self.prompt_user(msg, reporter)?;
+
+                    match action {
+                        Action::Fix(correction) => {
+                            let mut typo = typo.into_owned();
+                            let correction =
+                                crate::case::to_same_case(typo.typo.as_ref(), &correction);
+                            typo.corrections = typos::Status::Corrections(vec![correction.into()]);
+                            fixes.push(typo);
+                        }
+                        Action::Ignore => {}
+                        Action::IgnoreAll => {
+                            let typo_str = typo.typo.as_ref().to_lowercase();
+                            self.ignore_list.lock().unwrap().insert(typo_str.clone());
+                            self.ignored_all.lock().unwrap().insert(typo_str);
+                        }
+                        Action::SkipFile => {
+                            // Can't just return, need to write out previous fixes
+                            // Drain the iterator
+                            for typo in typo_it {
+                                drop(typo);
+                            }
+                            break;
+                        }
+                        Action::Quit => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                "user-quit",
+                            ));
+                        }
+                    }
+                }
+
+                if !fixes.is_empty() || path == std::path::Path::new("-") {
+                    let buffer = fix_buffer(buffer, fixes.into_iter());
+                    write_file(path, content_type, buffer, reporter)?;
+                }
+            }
+        }
+
+        if policy.check_filenames {
+            if let Some(file_name) = path.file_name().and_then(|s| s.to_str()) {
+                let mut fixes = Vec::new();
+                let typos: Vec<_> = check_str(file_name, policy).collect();
+                let mut typo_it = typos.into_iter().peekable();
+                while let Some(typo) = typo_it.next() {
+                    if self
+                        .ignore_list
+                        .lock()
+                        .unwrap()
+                        .contains(&typo.typo.as_ref().to_lowercase())
+                    {
+                        continue;
+                    }
+
+                    let (_line, line_offset) = extract_line(file_name.as_bytes(), typo.byte_offset);
+                    let msg = report::Typo {
+                        context: Some(report::PathContext { path }.into()),
+                        buffer: std::borrow::Cow::Borrowed(file_name.as_bytes()),
+                        byte_offset: line_offset,
+                        typo: typo.typo.as_ref(),
+                        corrections: typo.corrections.clone(),
+                    };
+                    let action = self.prompt_user(msg, reporter)?;
+
+                    match action {
+                        Action::Fix(correction) => {
+                            let mut typo = typo.into_owned();
+                            let correction =
+                                crate::case::to_same_case(typo.typo.as_ref(), &correction);
+                            typo.corrections = typos::Status::Corrections(vec![correction.into()]);
+                            fixes.push(typo);
+                        }
+                        Action::Ignore => {}
+                        Action::IgnoreAll => {
+                            let typo_str = typo.typo.as_ref().to_lowercase();
+                            self.ignore_list.lock().unwrap().insert(typo_str.clone());
+                            self.ignored_all.lock().unwrap().insert(typo_str);
+                        }
+                        Action::SkipFile => {
+                            return Ok(());
+                        }
+                        Action::Quit => {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::Interrupted,
+                                "user-quit",
+                            ));
+                        }
+                    }
+                }
+
+                if !fixes.is_empty() {
+                    let file_name = file_name.to_owned().into_bytes();
+                    let new_name = fix_buffer(file_name, fixes.into_iter());
+                    let new_name =
+                        String::from_utf8(new_name).expect("corrections are valid utf-8");
+                    let new_path = path.with_file_name(new_name);
+                    std::fs::rename(path, new_path)?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+enum Action {
+    Fix(String),
+    Ignore,
+    IgnoreAll,
+    SkipFile,
+    Quit,
+}
+
+impl InteractiveChecker {
+    fn call_openrouter(
+        &self,
+        file: &str,
+        line_num: usize,
+        line_content: &str,
+        typo: &str,
+        corrections: &[&str],
+    ) -> Option<Action> {
+        let api_key = match std::env::var("OPENROUTER_API_KEY") {
+            Ok(val) => val,
+            Err(_) => {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "Warning: OPENROUTER_API_KEY environment variable not set. Falling back to manual input."
+                );
+                return None;
+            }
+        };
+
+        let corrections_str = if corrections.is_empty() {
+            "None".to_owned()
+        } else {
+            corrections.join(", ")
+        };
+
+        let prompt = format!(
+            "You are an automated typo corrector helper. Below is a spell checking issue found in a file.\n\
+            Your task is to analyze the issue and decide the best action to take.\n\n\
+            Instructions:\n\
+            1. The target language is English.\n\
+            2. If the file is non-English, contains binary data, is an exact quoting from a source, is deliberate nonsense, or similar cases, you should skip to the next file (choose \"skip\").\n\
+            3. Do not correct valid spelling variations (e.g., color vs colour).\n\
+            4. The option \"ignore_all\" will add the word to a future dictionary to ignore it globally. Use \"ignore_all\" only if you are absolutely sure it is correct or should always be ignored (e.g., technical conventions like \"idx\" for a list index, API/library names, or brand names).\n\
+            5. If you are truly not sure what to correct the typo to, then ignore the word (choose \"ignore\").\n\n\
+            Context:\n\
+            File: {file}\n\
+            Line: {line_num}\n\
+            Line Content: {line_content}\n\
+            Typo: {typo}\n\
+            Suggested Corrections: {corrections_str}\n\n\
+            Options:\n\
+            - \"ignore\": Keep the word as is.\n\
+            - \"ignore_all\": Ignore all occurrences of this word.\n\
+            - \"skip\": Skip processing this file.\n\
+            - \"quit\": Stop execution.\n\
+            - \"fix:<correction>\": Choose one of the suggested corrections, or provide a custom correction.\n\n\
+            Respond with exactly one of the options (e.g. \"ignore\", \"ignore_all\", \"skip\", \"quit\", or \"fix:interactive\"). Output ONLY the chosen option and nothing else."
+        );
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .ok()?;
+        let response = match client
+            .post("https://openrouter.ai/api/v1/chat/completions")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .json(&serde_json::json!({
+                "model": "openrouter/auto",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ]
+            }))
+            .send()
+        {
+            Ok(res) => res,
+            Err(e) => {
+                let _ = writeln!(std::io::stderr(), "Error calling OpenRouter: {e}");
+                return None;
+            }
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let err_text = response.text().unwrap_or_default();
+            let _ = writeln!(
+                std::io::stderr(),
+                "OpenRouter API error (status {status}): {err_text}"
+            );
+            return None;
+        }
+
+        let res_json: serde_json::Value = match response.json() {
+            Ok(json) => json,
+            Err(e) => {
+                let _ = writeln!(std::io::stderr(), "Error parsing OpenRouter response JSON: {e}");
+                return None;
+            }
+        };
+
+        let choice = res_json["choices"][0]["message"]["content"]
+            .as_str()
+            .map(|s| s.trim())
+            .unwrap_or("");
+
+        if choice.is_empty() {
+            let _ = writeln!(std::io::stderr(), "Empty response received from OpenRouter.");
+            return None;
+        }
+
+        let _ = writeln!(std::io::stderr(), "[LLM choice] -> {choice}");
+
+        let action = if choice == "ignore" {
+            Action::Ignore
+        } else if choice == "ignore_all" {
+            Action::IgnoreAll
+        } else if choice == "skip" {
+            Action::SkipFile
+        } else if choice == "quit" {
+            Action::Quit
+        } else if let Some(stripped) = choice.strip_prefix("fix:") {
+            Action::Fix(stripped.trim().to_owned())
+        } else if let Some(stripped) = choice.strip_prefix("fix ") {
+            Action::Fix(stripped.trim().to_owned())
+        } else {
+            Action::Fix(choice.to_owned())
+        };
+
+        Some(action)
+    }
+
+    fn prompt_user(
+        &self,
+        msg: report::Typo<'_>,
+        reporter: &dyn report::Report,
+    ) -> Result<Action, std::io::Error> {
+        reporter.report(msg.clone().into())?;
+
+        let corrections = if let typos::Status::Corrections(ref c) = msg.corrections {
+            c.iter()
+                .flat_map(|s| s.split(", "))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        if self.llm {
+            let file_path = match &msg.context {
+                Some(report::Context::File(c)) => c.path.display().to_string(),
+                Some(report::Context::Path(c)) => c.path.display().to_string(),
+                None => "-".to_owned(),
+            };
+
+            let line_num = match &msg.context {
+                Some(report::Context::File(c)) => c.line_num,
+                _ => 1,
+            };
+
+            let line_content = String::from_utf8_lossy(&msg.buffer).to_string();
+
+            if let Some(action) = self.call_openrouter(
+                &file_path,
+                line_num,
+                &line_content,
+                msg.typo,
+                &corrections,
+            ) {
+                return Ok(action);
+            }
+        }
+
+        loop {
+            let mut options = String::new();
+            for (i, correction) in corrections.iter().enumerate() {
+                use std::fmt::Write;
+                write!(&mut options, ", [{}]: fix as `{}`", i + 1, correction).unwrap();
+            }
+            // Print prompts to stderr so they appear even when stdout is redirected
+            use std::io::Write as _;
+            if let Some(stderr) = &self.stderr_override {
+                let mut err = stderr.lock().unwrap();
+                write!(
+                    err,
+                    "What to do? [i]gnore, ignore [a]ll, [s]kip file, [q]uit{}? ",
+                    options
+                )?;
+                err.flush()?;
+            } else {
+                let mut err = std::io::stderr();
+                write!(
+                    err,
+                    "What to do? [i]gnore, ignore [a]ll, [s]kip file, [q]uit{}? ",
+                    options
+                )?;
+                err.flush()?;
+            }
+
+            use std::io::BufRead;
+            let mut input = String::new();
+            let read_n = if let Some(stdin) = &self.stdin_override {
+                let mut stdin = stdin.lock().unwrap();
+                stdin.read_line(&mut input)?
+            } else if let Some(tty) = &self.tty {
+                let mut tty = tty.lock().unwrap();
+                input.clear();
+                tty.read_line(&mut input)?
+            } else {
+                std::io::stdin().read_line(&mut input)?
+            };
+
+            if read_n == 0 {
+                // EOF in non-tty contexts → don't prompt per-typo; just ignore this one
+                return Ok(Action::Ignore);
+            }
+            let choice = input.trim();
+
+            if choice.is_empty() {
+                // Hitting ENTER defaults to ignore
+                return Ok(Action::Ignore);
+            }
+            if choice == "i" {
+                return Ok(Action::Ignore);
+            } else if choice == "a" {
+                return Ok(Action::IgnoreAll);
+            } else if choice == "s" {
+                return Ok(Action::SkipFile);
+            } else if choice == "q" {
+                return Ok(Action::Quit);
+            } else if let Ok(idx) = choice.parse::<usize>() {
+                if idx > 0 && idx <= corrections.len() {
+                    return Ok(Action::Fix(corrections[idx - 1].to_string()));
+                }
+            }
+            writeln!(std::io::stderr(), "Invalid choice: {}", choice)?;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct DiffTypos;
 
 impl FileChecker for DiffTypos {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn check_file(
         &self,
         path: &std::path::Path,
@@ -249,6 +722,10 @@ impl FileChecker for DiffTypos {
 pub struct HighlightIdentifiers;
 
 impl FileChecker for HighlightIdentifiers {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn check_file(
         &self,
         path: &std::path::Path,
@@ -356,6 +833,10 @@ impl FileChecker for HighlightIdentifiers {
 pub struct Identifiers;
 
 impl FileChecker for Identifiers {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn check_file(
         &self,
         path: &std::path::Path,
@@ -418,6 +899,10 @@ impl FileChecker for Identifiers {
 pub struct HighlightWords;
 
 impl FileChecker for HighlightWords {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn check_file(
         &self,
         path: &std::path::Path,
@@ -536,6 +1021,10 @@ static UNMATCHED: anstyle::Style = anstyle::Style::new().effects(anstyle::Effect
 pub struct Words;
 
 impl FileChecker for Words {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn check_file(
         &self,
         path: &std::path::Path,
@@ -606,6 +1095,10 @@ impl FileChecker for Words {
 pub struct FileTypes;
 
 impl FileChecker for FileTypes {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn check_file(
         &self,
         path: &std::path::Path,
@@ -636,6 +1129,10 @@ impl FileChecker for FileTypes {
 pub struct FoundFiles;
 
 impl FileChecker for FoundFiles {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn check_file(
         &self,
         path: &std::path::Path,
@@ -1161,3 +1658,74 @@ mod test {
         assert_eq!(line[offset], buffer[buffer_offset]);
     }
 }
+
+    #[test]
+    #[cfg(feature = "dict")]
+    fn test_interactive_rename_order() {
+        // This test verifies that if a file is renamed by the interactive checker,
+        // the subsequent file content check does not crash due to file not found.
+        // This reproduces the reported bug where filename check ran before file content check.
+
+        // Setup file system
+        let temp_dir = assert_fs::TempDir::new().unwrap();
+        let file_name = "teh.txt";
+        let file_path = temp_dir.path().join(file_name);
+        std::fs::write(&file_path, "content").unwrap();
+
+        // Input: Select "1" (fix) for the filename typo.
+        // "teh" should be corrected to "the".
+        let input = b"1\n";
+        let stdin = std::sync::Arc::new(std::sync::Mutex::new(std::io::Cursor::new(input)));
+
+        // Sink for stderr
+        let stderr = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // Setup checker
+        let checker = InteractiveChecker {
+            ignore_list: Default::default(),
+            ignored_all: Default::default(),
+            interactive: true,
+            tty: None,
+            dump_ignores: None,
+            stdin_override: Some(stdin),
+            stderr_override: Some(stderr),
+            llm: false,
+        };
+
+        // Setup Policy
+        let mut policy = crate::policy::Policy::default();
+        policy.check_filenames = true;
+        policy.check_files = true;
+
+        // Setup Reporter
+        struct TestReporter {
+            messages: std::sync::Mutex<Vec<String>>,
+        }
+        impl report::Report for TestReporter {
+            fn report(&self, msg: report::Message<'_>) -> Result<(), std::io::Error> {
+                if let report::Message::Error(e) = msg {
+                    self.messages.lock().unwrap().push(e.msg);
+                }
+                Ok(())
+            }
+        }
+        let reporter = TestReporter { messages: std::sync::Mutex::new(Vec::new()) };
+
+        // Run check
+        // Expected behavior with bug:
+        // 1. check_filenames runs, prompts user, user says fix.
+        // 2. File is renamed to "the.txt".
+        // 3. check_files runs on "teh.txt", fails because file does not exist.
+
+        let result = checker.check_file(&file_path, false, &policy, &reporter);
+
+        assert!(result.is_ok(), "check_file failed: {:?}", result.err());
+
+        // Verify rename happened
+        assert!(!file_path.exists());
+        assert!(temp_dir.path().join("the.txt").exists());
+
+        // Verify NO error was reported
+        let messages = reporter.messages.lock().unwrap();
+        assert!(messages.is_empty(), "Expected no error message, but got: {:?}", messages);
+    }

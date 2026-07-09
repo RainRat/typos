@@ -34,6 +34,12 @@ fn run() -> proc_exit::ExitResult {
 
     init_logging(args.verbose.log_level());
 
+    use std::io::IsTerminal as _;
+    if args.interactive && !(std::io::stdin().is_terminal() && std::io::stderr().is_terminal()) {
+        eprintln!("error: --interactive requires a TTY (stdin and stderr). Try --write-changes or --diff.");
+        std::process::exit(2);
+    }
+
     if let Some(output_path) = args.dump_config.as_ref() {
         run_dump_config(&args, output_path)
     } else if args.type_list {
@@ -146,6 +152,9 @@ fn run_type_list(args: &args::Args) -> proc_exit::ExitResult {
 }
 
 fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
+    let checker = pick_checker(args);
+    let selected_checks = checker.as_ref();
+
     let global_cwd = std::env::current_dir()
         .map_err(|err| {
             let kind = err.kind();
@@ -230,7 +239,7 @@ fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
             .with_code(proc_exit::sysexits::CONFIG_ERR)?;
         let walk_policy = engine.walk(&cwd);
 
-        let threads = if path.is_file() || args.sort {
+        let threads = if path.is_file() || args.sort || args.interactive || args.llm {
             1
         } else {
             args.threads
@@ -284,27 +293,7 @@ fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
         let status_reporter = report::MessageStatus::new(global_reporter.as_ref());
         let reporter: &dyn Report = &status_reporter;
 
-        let selected_checks: &dyn typos_cli::file::FileChecker = if args.files {
-            &typos_cli::file::FoundFiles
-        } else if args.file_types {
-            &typos_cli::file::FileTypes
-        } else if args.highlight_identifiers {
-            &typos_cli::file::HighlightIdentifiers
-        } else if args.identifiers {
-            &typos_cli::file::Identifiers
-        } else if args.highlight_words {
-            &typos_cli::file::HighlightWords
-        } else if args.words {
-            &typos_cli::file::Words
-        } else if args.write_changes {
-            &typos_cli::file::FixTypos
-        } else if args.diff {
-            &typos_cli::file::DiffTypos
-        } else {
-            &typos_cli::file::Typos
-        };
-
-        if single_threaded {
+        let walk_result = if single_threaded {
             typos_cli::file::walk_path(
                 walk.build(),
                 selected_checks,
@@ -320,8 +309,18 @@ fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
                 reporter,
                 args.force_exclude,
             )
+        };
+
+        if let Some(interactive_checker) =
+            checker.as_any().downcast_ref::<typos_cli::file::InteractiveChecker>()
+        {
+            if let Err(err) = interactive_checker.write_ignored() {
+                errors_found = true;
+                log::error!("could not write ignored typos: {err}");
+            }
         }
-        .map_err(|e| {
+
+        walk_result.map_err(|e| {
             e.io_error()
                 .map(|i| {
                     let kind = i.kind();
@@ -332,6 +331,7 @@ fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
                 .unwrap_or_default()
                 .with_message(e)
         })?;
+
         if status_reporter.typos_found() {
             typos_found = true;
         }
@@ -356,6 +356,40 @@ fn run_checks(args: &args::Args) -> proc_exit::ExitResult {
     } else {
         proc_exit::Code::SUCCESS.ok()
     }
+}
+
+fn pick_checker(args: &args::Args) -> Box<dyn typos_cli::file::FileChecker> {
+    if args.interactive || args.llm {
+        let mut ic = typos_cli::file::InteractiveChecker::default();
+        ic.dump_ignores = args.dump_ignores.clone();
+        ic.llm = args.llm;
+        return Box::new(ic);
+    }
+    if args.diff {
+        return Box::new(typos_cli::file::DiffTypos);
+    }
+    if args.write_changes {
+        return Box::new(typos_cli::file::FixTypos);
+    }
+    if args.files {
+        return Box::new(typos_cli::file::FoundFiles);
+    }
+    if args.file_types {
+        return Box::new(typos_cli::file::FileTypes);
+    }
+    if args.highlight_identifiers {
+        return Box::new(typos_cli::file::HighlightIdentifiers);
+    }
+    if args.identifiers {
+        return Box::new(typos_cli::file::Identifiers);
+    }
+    if args.highlight_words {
+        return Box::new(typos_cli::file::HighlightWords);
+    }
+    if args.words {
+        return Box::new(typos_cli::file::Words);
+    }
+    Box::new(typos_cli::file::Typos)
 }
 
 fn init_logging(level: Option<log::Level>) {

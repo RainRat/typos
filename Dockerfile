@@ -1,6 +1,6 @@
 ARG DEBIAN_DIST=bullseye
 
-FROM rust:${DEBIAN_DIST} as builder
+FROM rust:${DEBIAN_DIST} AS builder
 WORKDIR /usr/src/typos
 COPY . .
 RUN cargo install --path ./crates/typos-cli
